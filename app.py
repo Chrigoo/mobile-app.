@@ -92,7 +92,18 @@ with tab_checkin:
             st.warning("Please enter your name before submitting.")
         else:
             photo_path = save_uploaded_photo(photo_file) if photo_file else None
-            success = storage.save_checkin(name=name, mood=mood, note=note, photo_path=photo_path)
+            success = False
+            try:
+                success = storage.save_checkin(name=name, mood=mood, note=note, photo_path=photo_path)
+            except TypeError:
+                # Graceful fallback if an older cached backend instance is in memory
+                try:
+                    success = storage.save_checkin(name=name, mood=mood, note=note)
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+
             if success:
                 st.session_state["just_submitted"] = True
                 st.rerun()
