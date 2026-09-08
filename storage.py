@@ -1,6 +1,7 @@
 """
 Storage layer for Daily Check-In application.
 Supports Supabase, Google Sheets (st-gsheets-connection), and local SQLite fallback.
+Includes photo upload handling and optimization for mobile capture.
 """
 
 from abc import ABC, abstractmethod
@@ -8,19 +9,54 @@ import datetime
 import os
 import sqlite3
 from typing import Optional, List, Dict, Any
+import uuid
+from PIL import Image, ImageOps
 import streamlit as st
+
+
+def save_uploaded_photo(uploaded_file, upload_dir: str = "uploads") -> Optional[str]:
+    """
+    Optimizes and saves a mobile camera photo or gallery upload.
+    Resizes image to max 800px dimension and saves as optimized JPEG.
+    Returns relative path to saved image, or None if no file was uploaded.
+    """
+    if uploaded_file is None:
+        return None
+    try:
+        os.makedirs(upload_dir, exist_ok=True)
+        img = Image.open(uploaded_file)
+        
+        # Correct orientation from mobile EXIF data
+        img = ImageOps.exif_transpose(img)
+        
+        # Convert RGBA/palette images to RGB for JPEG
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+            
+        # Downscale large mobile camera photos
+        img.thumbnail((800, 800), Image.Resampling.LANCZOS)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"photo_{timestamp}_{uuid.uuid4().hex[:6]}.jpg"
+        filepath = os.path.join(upload_dir, filename)
+        
+        img.save(filepath, format="JPEG", quality=80, optimize=True)
+        return filepath
+    except Exception as e:
+        st.error(f"Error processing image: {e}")
+        return None
 
 
 class StorageBackend(ABC):
     backend_name: str = "Base"
 
     @abstractmethod
-    def save_checkin(self, name: str, mood: str, note: str) -> bool:
+    def save_checkin(self, name: str, mood: str, note: str, photo_path: Optional[str] = None) -> bool:
         """Save a new check-in entry."""
         pass
 
     @abstractmethod
-    def get_recent_checkins(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_checkins(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Retrieve recent check-in entries ordered by date descending."""
         pass
 
@@ -52,23 +88,29 @@ class SQLiteBackend(StorageBackend):
                     created_at TEXT NOT NULL,
                     name TEXT NOT NULL,
                     mood TEXT NOT NULL,
-                    note TEXT
+                    note TEXT,
+                    photo_path TEXT
                 )
                 """
             )
+            # Auto-migrate table if photo_path column was not present in earlier schema
+            cursor.execute("PRAGMA table_info(checkins)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "photo_path" not in columns:
+                cursor.execute("ALTER TABLE checkins ADD COLUMN photo_path TEXT")
             conn.commit()
 
-    def save_checkin(self, name: str, mood: str, note: str) -> bool:
+    def save_checkin(self, name: str, mood: str, note: str, photo_path: Optional[str] = None) -> bool:
         try:
             now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    INSERT INTO checkins (created_at, name, mood, note)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO checkins (created_at, name, mood, note, photo_path)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (now_iso, name.strip(), mood, note.strip() if note else ""),
+                    (now_iso, name.strip(), mood, note.strip() if note else "", photo_path),
                 )
                 conn.commit()
             return True
@@ -76,13 +118,13 @@ class SQLiteBackend(StorageBackend):
             st.error(f"Error saving to SQLite: {e}")
             return False
 
-    def get_recent_checkins(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_checkins(self, limit: int = 50) -> List[Dict[str, Any]]:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT id, created_at, name, mood, note
+                    SELECT id, created_at, name, mood, note, photo_path
                     FROM checkins
                     ORDER BY id DESC
                     LIMIT ?
@@ -104,13 +146,14 @@ class SupabaseBackend(StorageBackend):
         self.table_name = table_name
         self.client: Client = create_client(url, key)
 
-    def save_checkin(self, name: str, mood: str, note: str) -> bool:
+    def save_checkin(self, name: str, mood: str, note: str, photo_path: Optional[str] = None) -> bool:
         try:
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
             payload = {
                 "name": name.strip(),
                 "mood": mood,
                 "note": note.strip() if note else "",
+                "photo_path": photo_path,
                 "created_at": now_iso,
             }
             res = self.client.table(self.table_name).insert(payload).execute()
@@ -119,11 +162,11 @@ class SupabaseBackend(StorageBackend):
             st.error(f"Error saving to Supabase: {e}")
             return False
 
-    def get_recent_checkins(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_checkins(self, limit: int = 50) -> List[Dict[str, Any]]:
         try:
             res = (
                 self.client.table(self.table_name)
-                .select("id, created_at, name, mood, note")
+                .select("id, created_at, name, mood, note, photo_path")
                 .order("created_at", desc=True)
                 .limit(limit)
                 .execute()
@@ -154,16 +197,16 @@ class GoogleSheetsBackend(StorageBackend):
         from streamlit_gsheets import GSheetsConnection
         return st.connection(self.connection_name, type=GSheetsConnection)
 
-    def save_checkin(self, name: str, mood: str, note: str) -> bool:
+    def save_checkin(self, name: str, mood: str, note: str, photo_path: Optional[str] = None) -> bool:
         import pandas as pd
         try:
             conn = self._get_connection()
             try:
                 df = conn.read(ttl=0)
                 if df is None or not isinstance(df, pd.DataFrame):
-                    df = pd.DataFrame(columns=["created_at", "name", "mood", "note"])
+                    df = pd.DataFrame(columns=["created_at", "name", "mood", "note", "photo_path"])
             except Exception:
-                df = pd.DataFrame(columns=["created_at", "name", "mood", "note"])
+                df = pd.DataFrame(columns=["created_at", "name", "mood", "note", "photo_path"])
 
             now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             new_row = pd.DataFrame([
@@ -172,6 +215,7 @@ class GoogleSheetsBackend(StorageBackend):
                     "name": name.strip(),
                     "mood": mood,
                     "note": note.strip() if note else "",
+                    "photo_path": photo_path or "",
                 }
             ])
             updated_df = pd.concat([df, new_row], ignore_index=True)
@@ -181,7 +225,7 @@ class GoogleSheetsBackend(StorageBackend):
             st.error(f"Error saving to Google Sheets: {e}")
             return False
 
-    def get_recent_checkins(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_checkins(self, limit: int = 50) -> List[Dict[str, Any]]:
         import pandas as pd
         try:
             conn = self._get_connection()
@@ -190,7 +234,7 @@ class GoogleSheetsBackend(StorageBackend):
                 return []
             
             # Ensure expected columns exist
-            for col in ["created_at", "name", "mood", "note"]:
+            for col in ["created_at", "name", "mood", "note", "photo_path"]:
                 if col not in df.columns:
                     df[col] = ""
 
@@ -236,4 +280,3 @@ def get_storage() -> StorageBackend:
 
     # 3. Fallback to Local SQLite
     return SQLiteBackend()
-

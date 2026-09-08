@@ -2,3 +2,4 @@
 .streamlit/secrets.toml
 *.db
 __pycache__/
+uploads/
